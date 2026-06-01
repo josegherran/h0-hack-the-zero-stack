@@ -120,3 +120,4 @@ src/api/generated/
 .eslintcache
 .stylelintcache
 storybook-static/
+.ideas/
