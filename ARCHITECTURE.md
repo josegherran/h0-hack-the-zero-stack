@@ -1,6 +1,6 @@
 # ContractLens — Architecture Document
 
-> **Version:** 1.1.0
+> **Version:** 1.2.0
 > **Status:** Draft
 > **Hackathon:** H01 (h01.devpost.com) — June 2026
 > **Last Updated:** June 2026
@@ -19,6 +19,7 @@
 8. [Tech Stack](#8-tech-stack)
 9. [Architecture Improvements](#9-architecture-improvements)
 10. [Architecture Compliance](#10-architecture-compliance)
+11. [Cross-Cutting Concerns (v1.2.0)](#11-cross-cutting-concerns-v120)
 
 ---
 
@@ -78,25 +79,32 @@ All organizations share the same database, Lambda function, and S3 bucket. Tenan
 graph TD
     subgraph Browser["Browser (Vercel CDN)"]
         UI["React + Vite\nshadcn/ui + Tailwind"]
-        PDFViewer["react-pdf\nPDF Viewer"]
+        PDFViewer["react-pdf (lazy)\nPDF Viewer"]
         ReactQuery["React Query\n(Orval generated hooks)"]
+        SSEClient["EventSource\nSSE client"]
     end
 
     subgraph Vercel["Vercel — API Routes (Node.js 22)"]
-        APIRoutes["Sync API Routes\n/api/*"]
+        APIRoutes["Sync API Routes\n/api/*\n(paginated lists)"]
         AIStream["Chat Streaming\n/api/chat\nVercel AI SDK"]
+        StatusStream["SSE Push\n/api/contracts/:id/status-stream"]
+        HealthEP["Health Check\n/api/health"]
         ClerkMW["Clerk\nJWT Middleware"]
+        OIDC["OIDC Federation\nAssumeRole → short-lived creds"]
     end
 
     subgraph AWS["AWS"]
+        CloudFront["CloudFront\nPDF CDN\n(signed URLs · OAC)"]
         S3["S3\nPDF File Storage\n(private bucket)"]
         SQS["SQS\nAnalysis Job Queue\n+ Dead Letter Queue"]
+        DLQAlarm["CloudWatch Alarm\nDLQ depth ≥ 1 → SNS"]
 
         subgraph LambdaGroup["Lambda (Node.js 22)"]
-            LambdaFn["Analysis Worker\n① pdf-parse\n② Bedrock InvokeModel\n③ Aurora write"]
+            LambdaFn["Analysis Worker\n① idempotency check\n② pdf-parse → extracted_text\n③ Bedrock InvokeModel\n④ Aurora write\n⑤ publish completion event"]
         end
 
-        Aurora["Aurora PostgreSQL\nServerless v2\norganizations · users\ncontracts · analyses\nfindings · key_dates · comments"]
+        Aurora["Aurora PostgreSQL\nServerless v2\norganizations · users\ncontracts · analyses\nfindings · key_dates\ncomments · organization_usage\naudit_logs"]
+        VercelKV["Vercel KV\n(Redis pub/sub)\ncompletion events"]
         SES["SES\nTransactional Email\n(key date alerts)"]
         Bedrock["Amazon Bedrock\nClaude 3.5 Sonnet"]
     end
@@ -105,43 +113,57 @@ graph TD
     UI -->|"① GET /api/upload-url"| APIRoutes
     APIRoutes -->|"② Presigned PUT URL"| UI
     UI -->|"③ PUT PDF (direct)"| S3
-    UI -->|"④ POST /api/contracts"| APIRoutes
-    APIRoutes -->|"⑤ INSERT contracts\nstatus=pending"| Aurora
-    APIRoutes -->|"⑥ SQS.sendMessage\n→ 202 Accepted"| SQS
+    UI -->|"④ POST /api/contracts\n(quota check)"| APIRoutes
+    APIRoutes -->|"⑤ INSERT contracts\nINCREMENT usage counter\nstatus=pending"| Aurora
+    APIRoutes -->|"⑥ SQS.sendMessage\n{contractId, correlationId}\n→ 202 Accepted"| SQS
+
+    %% SSE subscription
+    SSEClient -->|"⑦ GET /status-stream\n(open SSE connection)"| StatusStream
+    StatusStream -->|"⑧ SUBSCRIBE contractId channel"| VercelKV
 
     %% Async analysis pipeline
-    SQS -->|"⑦ Event trigger"| LambdaFn
-    LambdaFn -->|"⑧ GetObject"| S3
-    LambdaFn -->|"⑨ Extract text\npdf-parse"| LambdaFn
-    LambdaFn -->|"⑩ InvokeModel\ntool use / structured JSON"| Bedrock
-    Bedrock -->|"⑪ findings + risk score"| LambdaFn
-    LambdaFn -->|"⑫ BEGIN TRANSACTION\nINSERT analyses\nINSERT findings\nINSERT key_dates\nUPDATE status=done\nCOMMIT"| Aurora
-    LambdaFn -->|"⑬ SendEmail\n(if key dates found)"| SES
+    SQS -->|"⑨ Event trigger"| LambdaFn
+    LambdaFn -->|"⑩ GetObject"| S3
+    LambdaFn -->|"⑪ Extract text\npdf-parse → extracted_text"| LambdaFn
+    LambdaFn -->|"⑫ InvokeModel\ntool use / structured JSON"| Bedrock
+    Bedrock -->|"⑬ findings + risk score"| LambdaFn
+    LambdaFn -->|"⑭ BEGIN TRANSACTION\nINSERT analyses (+ extracted_text)\nINSERT findings · key_dates\nUPDATE status=done\nCOMMIT"| Aurora
+    LambdaFn -->|"⑮ PUBLISH {status:done}"| VercelKV
+    LambdaFn -->|"⑯ SendEmail\n(if key dates found)"| SES
 
-    %% Polling & display
-    ReactQuery -->|"⑭ GET /api/contracts/:id\n(every 2s)"| APIRoutes
-    APIRoutes -->|"⑮ SELECT + JOIN"| Aurora
-    Aurora -->|"⑯ Full payload"| APIRoutes
-    APIRoutes -->|"⑰ JSON response"| ReactQuery
-    ReactQuery --> UI
-    ReactQuery --> PDFViewer
+    %% SSE push delivery
+    VercelKV -->|"⑰ event: done"| StatusStream
+    StatusStream -->|"⑱ SSE data: {status:done}"| SSEClient
+    SSEClient --> UI
+
+    %% Fallback polling (30s interval)
+    ReactQuery -.->|"Fallback poll\nevery 30s"| APIRoutes
+    APIRoutes -.->|"SELECT + JOIN"| Aurora
+
+    %% PDF delivery via CloudFront
+    PDFViewer -->|"Signed URL request"| CloudFront
+    CloudFront -->|"OAC"| S3
 
     %% Chat streaming
-    UI -->|"Natural language question"| AIStream
-    AIStream -->|"InvokeModelWithResponseStream\n(contract context)"| Bedrock
+    UI -->|"Natural language question\n+ extracted_text from cache"| AIStream
+    AIStream -->|"InvokeModelWithResponseStream"| Bedrock
     Bedrock -->|"Token stream"| AIStream
     AIStream -->|"SSE (text/event-stream)"| UI
 
-    %% Auth cross-cutting
+    %% DLQ alerting
+    SQS -.->|"Dead letters"| DLQAlarm
+
+    %% Auth + OIDC cross-cutting
     ClerkMW -.->|"JWT validation\non every request"| APIRoutes
+    OIDC -.->|"Short-lived AWS creds\n(S3, SQS, Bedrock)"| APIRoutes
 
     classDef aws fill:#FF9900,color:#000,stroke:#c47400
     classDef vercel fill:#171717,color:#fff,stroke:#444
     classDef browser fill:#1a73e8,color:#fff,stroke:#1557b0
 
-    class S3,SQS,LambdaFn,Aurora,SES,Bedrock aws
-    class APIRoutes,AIStream,ClerkMW vercel
-    class UI,PDFViewer,ReactQuery browser
+    class CloudFront,S3,SQS,LambdaFn,Aurora,SES,Bedrock,DLQAlarm aws
+    class APIRoutes,AIStream,StatusStream,HealthEP,ClerkMW,OIDC,VercelKV vercel
+    class UI,PDFViewer,ReactQuery,SSEClient browser
 ```
 
 ### 4.2 Upload Sequence
@@ -257,9 +279,13 @@ Persistent storage layer. All data is owned by AWS services in the same account 
 |---|---|
 | Authentication | Clerk (JWT issued to browser, validated on every API Route) |
 | Tenant isolation | `organization_id` filter on every Aurora query |
-| Observability | Vercel logs (API layer) + CloudWatch (Lambda + SQS + Aurora) |
-| Security | IAM least-privilege for Lambda; S3 presigned URLs expire in 5 min; HTTPS everywhere |
+| Observability | Vercel logs (API layer) + CloudWatch (Lambda + SQS + Aurora) + Sentry (error tracking, both layers) |
+| Security | IAM least-privilege for Lambda; OIDC-federated short-lived credentials for Vercel API Routes; S3 presigned URLs expire in 5 min; HTTPS everywhere; CSP headers on all responses |
 | Email delivery | AWS SES (same account, no extra vendor) |
+| Correlation | `correlationId` (= `contractId`) emitted as a structured log field in Vercel, SQS message attributes, and Lambda; enables end-to-end trace reconstruction |
+| Plan enforcement | `organization_usage` table tracks monthly contract counts; enforced at API Route and Lambda layers |
+| Audit trail | `audit_logs` table records compliance-sensitive events; append-only, scoped by `organization_id` |
+| Liveness | `GET /api/health` endpoint verifies Aurora connectivity; monitored at 30-second intervals |
 
 ---
 
@@ -285,28 +311,32 @@ Routes are stateless and horizontally scalable. They do not perform LLM calls �
 
 A single Lambda function triggered by SQS events. It is the only component that calls Amazon Bedrock for analysis (not chat). Its execution is:
 
-1. Receive SQS message `{ contractId, s3Key }`
-2. Update contract status to `analyzing`
-3. Fetch PDF from S3
-4. Extract text with `pdf-parse`
-5. Chunk text if > 100k tokens
-6. Call Amazon Bedrock (`InvokeModel`) with Claude 3.5 Sonnet and the structured analysis prompt using Claude's **tool use** feature to enforce a typed JSON response
-7. Parse and validate the JSON response with Zod
-8. Write all results to Aurora in a single transaction
-9. Update contract status to `done`
-10. Send SES email if key dates were found
+1. Receive SQS message `{ contractId, s3Key, correlationId }`
+2. **Idempotency check:** query Aurora for the contract's current status; if already `done`, exit immediately without invoking Bedrock (NFR-03.6)
+3. Update contract status to `analyzing`
+4. Start a background heartbeat loop: call `ChangeMessageVisibility` every 4 minutes to extend SQS visibility, preventing re-queuing during long analyses (NFR-03.5)
+5. Fetch PDF from S3
+6. Extract text with `pdf-parse`; store result in memory as `extracted_text`
+7. Chunk text if > 100k tokens
+8. Call Amazon Bedrock (`InvokeModel`) with Claude 3.5 Sonnet and the structured analysis prompt using Claude's **tool use** feature to enforce a typed JSON response
+9. Parse and validate the JSON response with Zod
+10. Write all results to Aurora in a single transaction: `INSERT analyses` (including `extracted_text`), `INSERT findings`, `INSERT key_dates`, `UPDATE contracts SET status='done'`
+11. Publish `{ contractId, status: 'done' }` to the Vercel KV pub/sub channel for `contractId` (triggers SSE push — NFR-01.6)
+12. Send SES email if key dates were found
+13. Emit structured log lines with `correlationId` at each step (NFR-05.5)
 
 Authentication to Bedrock uses the Lambda's **IAM execution role** — no API key is required. The role is granted `bedrock:InvokeModel` scoped to the Claude 3.5 Sonnet model ARN.
 
-On any unhandled error, the contract status is set to `error` and the SQS message is retried up to 3 times before landing in the DLQ.
+On any unhandled error, the contract status is set to `error`, the heartbeat loop is cancelled, and the SQS message is retried up to 3 times before landing in the DLQ. Sentry captures the error with `contractId` and `organizationId` as context tags (NFR-05.7).
 
 ### 6.3 AWS SQS Queue
 
 A Standard Queue (not FIFO — ordering is not required for analysis jobs). Configuration:
-- **Visibility timeout:** 5 minutes (matches Lambda max expected duration)
+- **Visibility timeout:** 17 minutes (Lambda max timeout 15 min + 2 min buffer; prevents re-queuing before completion — NFR-03.5)
 - **Message retention:** 4 days
 - **Max receive count:** 3 (before DLQ)
-- **Dead Letter Queue:** captures failed jobs for inspection and manual replay
+- **Dead Letter Queue:** captures failed jobs for inspection and manual replay; a CloudWatch Alarm fires on `NumberOfMessagesSent ≥ 1` within 2 minutes (NFR-05.6)
+- **Message attributes:** `correlationId` (= `contractId`) included on every message for end-to-end log tracing (NFR-05.5)
 
 ### 6.4 AWS Aurora PostgreSQL (Serverless v2)
 
@@ -331,7 +361,11 @@ Handles user registration, login (email/password + OAuth), session management, a
 
 ### 6.7 Vercel AI SDK — Chat Streaming
 
-The `/api/chat` route uses the Vercel AI SDK's `streamText` function with the `@ai-sdk/amazon-bedrock` provider to stream Claude 3.5 Sonnet responses to the browser via SSE (`text/event-stream`). The Vercel API Route authenticates to Bedrock using AWS credentials stored as environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`). The contract's extracted text is injected as context in the system prompt, scoped to the authenticated user's organization.
+The `/api/chat` route uses the Vercel AI SDK's `streamText` function with the `@ai-sdk/amazon-bedrock` provider to stream Claude 3.5 Sonnet responses to the browser via SSE (`text/event-stream`). The Vercel API Route authenticates to Bedrock using **short-lived credentials acquired via OIDC federation** (`AWS_ROLE_ARN` assumed at request time — replaces static `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from v1.1.0, see ADR-009). The contract's extracted text is read from `analyses.extracted_text` (populated by the Lambda worker during analysis) and injected as context in the system prompt — no S3 fetch is required on each chat turn (NFR-01.9). The text is scoped to the authenticated user's organization before injection.
+
+### 6.8a SSE Status Stream — `/api/contracts/:id/status-stream`
+
+A dedicated Vercel API Route that holds an open SSE connection and delivers a single push event when analysis completes. On connection open, the route subscribes to a Vercel KV pub/sub channel keyed by `contractId`. When the Lambda worker publishes `{ status: 'done' }` to that channel, the route emits `data: { status: "done" }\n\n` and closes the stream. If no event arrives within 30 seconds, the browser's fallback polling resumes (NFR-01.6). This replaces the primary 2-second polling loop, reducing Aurora Data API calls from O(N × duration / 2) to O(1) per analysis.
 
 ### 6.8 AWS SES — Email Alerts
 
@@ -485,6 +519,38 @@ Sends transactional emails when key dates are extracted from a contract. Lambda 
 
 ---
 
+### ADR-009 — Replace Long-Lived IAM Keys in Vercel with OIDC Federation
+
+**Status:** Accepted (v1.2.0)
+
+**Context:** Vercel API Routes previously authenticated to AWS using a static `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` IAM user key pair stored as environment variables. These credentials had no expiry. A key leak would expose S3 (presigned URL generation), SQS (enqueue analysis jobs), SES (send email), and Bedrock (chat streaming) with no automatic revocation.
+
+**Decision:** Configure an AWS IAM Identity Provider trusting GitHub's OIDC token endpoint. Create a scoped IAM role (`contractlens-vercel-api-role`) with a trust policy allowing the GitHub Actions OIDC provider to assume it. Vercel API Routes use `@aws-sdk/credential-providers`' `fromWebIdentity()` to exchange a GitHub OIDC token for short-lived STS credentials at request time. The static key pair is removed from all environments.
+
+**Consequences:**
+- Credentials expire after 1 hour and are never stored at rest in Vercel
+- Requires a one-time IAM Identity Provider and role setup in the AWS console
+- GitHub Actions OIDC token exchange adds ~50ms to the first AWS SDK call per function cold start (negligible)
+- `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are removed; `AWS_ROLE_ARN` is added
+
+---
+
+### ADR-010 — Replace Polling with SSE Push via Vercel KV for Analysis Completion
+
+**Status:** Accepted (v1.2.0)
+
+**Context:** The original design used 2-second polling (`GET /api/contracts/:id`) to detect when analysis completed. At 100 concurrent uploads, this generates 50 Aurora Data API requests per second with near-zero information content (status has not changed). Aurora Data API charges per request; polling cost scales linearly with active user count.
+
+**Decision:** Introduce a Vercel KV (Redis) pub/sub channel as a lightweight event bus. When the Lambda worker writes `status=done` to Aurora, it also publishes `{ contractId, status: 'done' }` to a KV channel keyed by `contractId`. A new SSE endpoint (`GET /api/contracts/:id/status-stream`) holds an open connection and forwards the KV event to the browser as a single SSE message. The browser switches from polling to `EventSource`, receives the push, and navigates to the analysis. Polling is retained as a 30-second fallback only.
+
+**Consequences:**
+- Aurora Data API calls during analysis reduced from ~15 (30s at 2s interval) to ~1 per analysis
+- Requires Vercel KV (Redis) — adds one new managed dependency
+- SSE connections are long-lived; Vercel functions have a streaming timeout that must accommodate the longest expected analysis (up to 30s); tested within Vercel's limits
+- No persistent connection infrastructure (WebSocket) required at this traffic level
+
+---
+
 ## 8. Tech Stack
 
 | Layer | Technology | Version | Role |
@@ -494,23 +560,27 @@ Sends transactional emails when key dates are extracted from a contract. Lambda 
 | Language | TypeScript | 5 | Type safety across frontend and backend |
 | UI components | shadcn/ui | latest | Accessible, unstyled component primitives |
 | Styling | Tailwind CSS | 4 | Utility-first CSS |
-| PDF viewer | react-pdf (pdfjs-dist) | 9 | In-browser PDF rendering + highlight |
+| PDF viewer | react-pdf (pdfjs-dist) | 9 | In-browser PDF rendering + highlight; lazy-loaded on detail route only |
 | Animation | Framer Motion | 11 | Risk Score gauge animation |
-| Server state | React Query (TanStack) | 5 | Polling, caching, server state |
+| Server state | React Query (TanStack) | 5 | Caching, server state; polling as 30s fallback only |
 | API codegen | Orval | 7 | OpenAPI → typed React Query hooks |
 | Backend runtime | Node.js | 22 | Vercel API Routes + Lambda |
-| API framework | Vercel API Routes | — | Sync REST endpoints |
+| API framework | Vercel API Routes | — | Sync REST endpoints + SSE streams |
 | ORM | Drizzle ORM | 0.41 | Type-safe Aurora queries |
 | Validation | Zod | 4 | Runtime schema validation |
 | Auth | Clerk | 6 | JWT, multi-tenant orgs, OAuth |
+| AWS credential provider | `@aws-sdk/credential-providers` | v3 | OIDC-federated short-lived credentials for Vercel → AWS (ADR-009) |
 | AI SDK | Vercel AI SDK + `@ai-sdk/amazon-bedrock` | 4 | Chat streaming via Bedrock |
 | LLM | Anthropic Claude 3.5 Sonnet (Amazon Bedrock) | — | Contract analysis + chat; IAM role auth in Lambda |
-| PDF parsing | pdf-parse | 1 | Server-side text extraction |
+| PDF parsing | pdf-parse | 1 | Server-side text extraction; output stored in `analyses.extracted_text` |
 | Database | AWS Aurora PostgreSQL | Serverless v2 | Primary data store |
-| File storage | AWS S3 | — | PDF binary storage |
-| Job queue | AWS SQS | Standard | Async analysis jobs |
-| Compute (async) | AWS Lambda | Node.js 22 | Analysis worker |
+| File storage | AWS S3 | — | PDF binary storage (private) |
+| PDF CDN | AWS CloudFront | — | Global PDF delivery; signed URLs; OAC in front of S3 |
+| Job queue | AWS SQS | Standard | Async analysis jobs; DLQ + CloudWatch alarm |
+| Compute (async) | AWS Lambda | Node.js 22 | Analysis worker with idempotency check and SQS heartbeat |
+| Event bus | Vercel KV (Redis pub/sub) | — | Analysis completion events from Lambda → SSE endpoint (ADR-010) |
 | Email | AWS SES | v2 | Transactional alerts |
+| Error tracking | Sentry | — | Error aggregation in Vercel API Routes and Lambda |
 | Frontend deploy | Vercel | — | CDN, CI/CD, preview deployments |
 
 ---
@@ -566,7 +636,11 @@ These are not in scope for the MVP but represent the natural evolution of the ar
 | Encrypted data in transit | ✅ | HTTPS on Vercel; TLS on Aurora; HTTPS on S3 |
 | Least-privilege IAM | ✅ | Lambda role: `s3:GetObject`, `sqs:ReceiveMessage`, `ses:SendEmail`, `bedrock:InvokeModel` (scoped to Claude model ARN), Aurora Data API only |
 | Short-lived credentials for upload | ✅ | S3 presigned URLs expire in 5 minutes |
+| No long-lived AWS credentials in Vercel | ✅ (v1.2.0) | OIDC federation — Vercel assumes `contractlens-vercel-api-role` via `fromWebIdentity()`; no static key pair stored |
 | No secrets in code | ✅ | All credentials in environment variables; Lambda→Bedrock uses IAM role (no API key) |
+| Content-Security-Policy headers | ✅ (v1.2.0) | CSP middleware applied to all Vercel API Route responses; `worker-src` permits pdfjs CDN path |
+| Plan quota enforcement | ✅ (v1.2.0) | `POST /api/contracts` checks `organization_usage`; Lambda performs idempotency check before Bedrock invocation |
+| Audit log | ✅ (v1.2.0) | `audit_logs` table; append-only; records contract view/delete and member events |
 
 ### Reliability Compliance
 
@@ -575,8 +649,12 @@ These are not in scope for the MVP but represent the natural evolution of the ar
 | Durable job delivery | ✅ | SQS Standard Queue with 4-day retention |
 | Automatic retry on failure | ✅ | SQS max receive count = 3; Lambda retry policy |
 | Failed job capture | ✅ | SQS Dead Letter Queue |
+| DLQ alerting | ✅ (v1.2.0) | CloudWatch Alarm on DLQ `NumberOfMessagesSent ≥ 1`; SNS notification within 2 minutes |
 | Atomic multi-table writes | ✅ | Single Aurora transaction for analysis results |
 | Consistent contract status | ✅ | Status only set to `done` after successful COMMIT |
+| No duplicate analyses | ✅ (v1.2.0) | Lambda idempotency check: exits if contract already `done` |
+| No analysis re-queue during long runs | ✅ (v1.2.0) | SQS visibility timeout = 17 min; Lambda `ChangeMessageVisibility` heartbeat every 4 min |
+| Liveness endpoint | ✅ (v1.2.0) | `GET /api/health` returns Aurora connectivity status; monitored at 30s intervals |
 
 ### Performance Compliance
 
@@ -584,9 +662,12 @@ These are not in scope for the MVP but represent the natural evolution of the ar
 |---|---|---|
 | Upload flow (presigned URL + S3 PUT) | < 3s | Direct browser → S3; no Vercel proxy |
 | Analysis end-to-end | < 30s | Lambda async; no Vercel timeout risk |
-| Dashboard load | < 1.5s | Indexed Aurora queries; Vercel CDN for static assets |
-| Chat first token | < 1s | Vercel AI SDK streaming; Bedrock Claude low latency |
+| Analysis completion delivery | ~1 Aurora read | SSE push via Vercel KV; polling reduced from O(N) to O(1) per analysis |
+| Dashboard load | < 1.5s | Indexed Aurora queries; Vercel CDN for static assets; paginated list endpoints |
+| Chat first token | < 600ms | Vercel AI SDK streaming; extracted_text from Aurora (no S3 re-fetch); Bedrock Claude low latency |
+| PDF load (global) | < 200ms TTFB | CloudFront distribution with OAC; 1-hour cache TTL |
 | Database auto-scaling | 0.5–16 ACU | Aurora Serverless v2 |
+| pdfjs bundle | Not on dashboard | Lazy-loaded via React.lazy() + Suspense; dedicated Vite chunk |
 
 ### Accessibility Compliance
 
@@ -599,4 +680,86 @@ These are not in scope for the MVP but represent the natural evolution of the ar
 
 ---
 
-*ContractLens ARCHITECTURE v1.1.0 — H01 Hackathon (h01.devpost.com) — June 2026*
+---
+
+## 11. Cross-Cutting Concerns (v1.2.0)
+
+This section documents the cross-cutting implementations introduced in v1.2.0 that touch multiple architecture layers.
+
+### 11.1 Correlation ID Threading
+
+Every log line across the full pipeline shares a `correlationId` equal to the `contractId`:
+
+| Layer | How the ID is carried |
+|---|---|
+| Vercel API Route | Logged as `{ correlationId }` on `POST /api/contracts` and every polling response |
+| SQS message | Included in message body as `correlationId` and as a message attribute |
+| Lambda | Extracted from SQS event at handler entry; injected into every `JSON.stringify` log call |
+| Aurora | `contracts.id` is the primary key used in all JOIN queries; correlates DB records to logs |
+
+A CloudWatch Logs Insights query template is maintained in `ops/queries/trace-by-contract.json` to reconstruct the full pipeline trace from a single `contractId`.
+
+### 11.2 OIDC Credential Acquisition Flow
+
+```
+GitHub Actions / Vercel runtime
+  │
+  ├─ Requests OIDC token from GitHub token endpoint
+  │  (token encodes: repo, branch, environment, actor)
+  │
+  └─ Calls STS AssumeRoleWithWebIdentity
+       Role: contractlens-vercel-api-role
+       Permissions: s3:PutObject (presigned), sqs:SendMessage, bedrock:InvokeModelWithResponseStream
+       Session duration: 1 hour
+       │
+       └─ Returns: { AccessKeyId, SecretAccessKey, SessionToken }
+            │
+            └─ Used by AWS SDK clients for the lifetime of the Vercel function instance
+```
+
+### 11.3 SSE Push Flow (Analysis Completion)
+
+```
+Browser                    Vercel /status-stream         Vercel KV            Lambda
+   │                               │                         │                   │
+   ├─ GET /status-stream ─────────>│                         │                   │
+   │                               ├─ SUBSCRIBE contractId ─>│                   │
+   │                               │   (blocking read)        │                   │
+   │                               │                         │   (analysis done) │
+   │                               │                         │<─ PUBLISH done ───│
+   │                               │<─ event received ───────│                   │
+   │<─ data: {status:"done"} ──────│                         │                   │
+   │                               ├─ close stream            │                   │
+   │                               │                         │                   │
+   ├─ navigate to /contracts/:id   │                         │                   │
+```
+
+If the SSE connection drops before the event arrives, the browser's `EventSource` reconnects automatically. After 30 seconds total without an event, the client falls back to 2-second polling.
+
+### 11.4 Plan Quota Enforcement Flow
+
+```
+POST /api/contracts
+  │
+  ├─ Clerk JWT validation → extract organizationId
+  ├─ SELECT contracts_analyzed FROM organization_usage
+  │   WHERE organization_id = ? AND month = current_month()
+  ├─ Compare against plan.limit (free=3, starter=20, pro=∞)
+  │
+  ├─ [over limit] → HTTP 429 { error: "QUOTA_EXCEEDED", limit, used, reset_date }
+  │
+  └─ [under limit] → continue
+       ├─ INSERT contract record
+       ├─ UPDATE organization_usage SET contracts_analyzed = contracts_analyzed + 1
+       └─ sendMessage to SQS
+
+Lambda (idempotency + secondary guard)
+  │
+  ├─ Re-check contract status in Aurora
+  ├─ [status = done] → exit (no Bedrock call)
+  └─ [status = pending/analyzing] → proceed with analysis
+```
+
+---
+
+*ContractLens ARCHITECTURE v1.2.0 — H01 Hackathon (h01.devpost.com) — June 2026*

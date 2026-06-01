@@ -1,6 +1,6 @@
 # ContractLens — Product Specification
 
-> **Version:** 1.1.0
+> **Version:** 1.2.0
 > **Status:** Draft
 > **Hackathon:** H01 (h01.devpost.com) — June 2026
 > **Track:** Monetizable B2B App
@@ -193,8 +193,13 @@ A single avoided bad clause (e.g., uncapped liability, missed auto-renewal) can 
 | NFR-01.1 | PDF upload (presigned URL request + S3 PUT) | < 3s for files up to 10 MB |
 | NFR-01.2 | Contract analysis end-to-end (SQS → Lambda → Aurora) | < 30s for contracts up to 30 pages |
 | NFR-01.3 | Dashboard initial load (API + render) | < 1.5s |
-| NFR-01.4 | Polling interval for analysis status | Every 2s |
-| NFR-01.5 | Chat first token latency (Vercel AI SDK + Bedrock streaming) | < 1s |
+| NFR-01.4 | Polling interval for analysis status (fallback only; see NFR-01.6) | Every 2s |
+| NFR-01.5 | Chat first token latency (Vercel AI SDK + Bedrock streaming) | < 600ms |
+| NFR-01.6 | Analysis completion is delivered to the browser via SSE push (`GET /api/contracts/:id/status-stream`); polling is a 30-second fallback only; each in-flight analysis consumes at most 1 Aurora query for the completion event (vs. O(duration/2) queries under pure polling) |
+| NFR-01.7 | `GET /api/contracts` and all list endpoints support cursor-based pagination (`?limit=25&cursor=<token>`); default limit = 25, maximum = 100; unbounded list responses are rejected with HTTP 400 |
+| NFR-01.8 | The `pdfjs-dist` worker bundle (~3 MB) is code-split into a dedicated chunk and lazy-loaded only when the contract detail route (`/contracts/:id`) is active; it is never loaded on the dashboard or landing page |
+| NFR-01.9 | The Lambda analysis worker stores the extracted plain-text of each contract in `analyses.extracted_text`; the `/api/chat` route reads this column rather than re-fetching the PDF from S3 on every chat turn |
+| NFR-01.10 | PDFs are served via a CloudFront distribution in front of S3 (signed URLs, OAC, 1-hour cache TTL); PDF first-byte latency < 200ms for users in the EU and APAC regions |
 
 ### NFR-02 — Scalability
 
@@ -213,6 +218,9 @@ A single avoided bad clause (e.g., uncapped liability, missed auto-renewal) can 
 | NFR-03.2 | Lambda analysis writes to Aurora in a single ACID transaction; partial writes roll back |
 | NFR-03.3 | Contract status is always consistent: a contract is never `done` without a complete analysis |
 | NFR-03.4 | Vercel API Routes are stateless and horizontally scalable |
+| NFR-03.5 | SQS visibility timeout is set to 17 minutes (Lambda max timeout 15 min + 2 min buffer); the Lambda worker also extends visibility via `ChangeMessageVisibility` heartbeats every 4 minutes during long-running analyses to prevent re-queuing |
+| NFR-03.6 | The Lambda analysis worker performs an idempotency check at startup: if the target contract is already `done`, the function exits without invoking Bedrock, preventing duplicate analyses from SQS re-deliveries |
+| NFR-03.7 | `GET /api/health` returns `{ "status": "ok", "db": "ok", "timestamp": "..." }` after executing `SELECT 1` against Aurora; returns HTTP 503 if Aurora is unreachable; the endpoint is monitored by an external uptime service at 30-second intervals |
 
 ### NFR-04 — Security
 
@@ -225,6 +233,10 @@ A single avoided bad clause (e.g., uncapped liability, missed auto-renewal) can 
 | NFR-04.5 | Lambda IAM role follows least-privilege: S3 read, SQS consume, Aurora write, SES send, Bedrock InvokeModel |
 | NFR-04.6 | All secrets (DB credentials) are stored in environment variables; Bedrock access uses Lambda IAM role — no API key needed |
 | NFR-04.7 | HTTPS enforced on all endpoints (Vercel + AWS API Gateway) |
+| NFR-04.8 | Vercel API Routes authenticate to AWS using short-lived credentials via OIDC federation (GitHub Actions OIDC → IAM AssumeRole); no long-lived `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` stored as environment variables |
+| NFR-04.9 | Every plan's monthly contract quota is enforced server-side: `POST /api/contracts` rejects with HTTP 429 if the organization's `contracts_analyzed_this_month` counter has reached the plan limit; the Lambda worker performs a secondary idempotency check before invoking Bedrock |
+| NFR-04.10 | All Vercel API Route responses include a `Content-Security-Policy` header; the CSP `worker-src` and `script-src` directives permit the pdfjs worker path served from the Vercel CDN |
+| NFR-04.11 | An immutable audit log records compliance-sensitive events per organization: contract viewed, contract deleted, member invited, member removed; log entries are append-only and scoped by `organization_id` |
 
 ### NFR-05 — Observability
 
@@ -234,6 +246,10 @@ A single avoided bad clause (e.g., uncapped liability, missed auto-renewal) can 
 | NFR-05.2 | Lambda structured logs to CloudWatch with contract ID and duration |
 | NFR-05.3 | Aurora slow query log enabled |
 | NFR-05.4 | SQS CloudWatch metrics: queue depth, age of oldest message, DLQ count |
+| NFR-05.5 | A `correlationId` (equal to `contractId`) is included as a structured field in every log line emitted by the Vercel API Route, SQS message attributes, and Lambda handler for a given analysis request; this enables end-to-end trace reconstruction using a single identifier |
+| NFR-05.6 | A CloudWatch Alarm on SQS DLQ `NumberOfMessagesSent ≥ 1` triggers an SNS notification within 2 minutes of the first failed analysis job landing in the DLQ |
+| NFR-05.7 | Application-level error tracking (Sentry or equivalent) is integrated in both the Vercel API layer and the Lambda worker; source maps are uploaded at build time; `contractId` and `organizationId` are attached as context tags to every error event |
+| NFR-05.8 | SLOs are defined and monitored for the two critical user-facing operations: analysis pipeline success rate ≥ 99%, and analysis end-to-end p95 latency ≤ 45s; CloudWatch alarms alert when either SLO is breached |
 
 ### NFR-06 — Accessibility
 
@@ -395,17 +411,19 @@ contracts
 
 -- Analyses (LLM output, versioned)
 analyses
-  id              UUID PK
-  contract_id     UUID FK → contracts
-  version         INT DEFAULT 1
-  risk_score      INT                        -- 0–100
-  risk_level      TEXT                       -- low | medium | high | critical
-  summary         TEXT
-  raw_llm_output  JSONB                      -- full LLM response
-  model_used      TEXT
-  tokens_used     INT
-  duration_ms     INT
-  created_at      TIMESTAMPTZ
+  id                  UUID PK
+  contract_id         UUID FK → contracts
+  version             INT DEFAULT 1
+  risk_score          INT                        -- 0–100
+  risk_level          TEXT                       -- low | medium | high | critical
+  summary             TEXT
+  extracted_text      TEXT                       -- plain-text extracted by pdf-parse; used by /api/chat to avoid re-fetching PDF from S3
+  raw_llm_output      JSONB                      -- full LLM response (archived to S3 after 90 days; see raw_llm_output_s3_key)
+  raw_llm_output_s3_key TEXT                     -- S3 key of gzip-archived LLM response once moved off Aurora
+  model_used          TEXT
+  tokens_used         INT
+  duration_ms         INT
+  created_at          TIMESTAMPTZ
 
 -- Findings (individual clause findings)
 findings
@@ -440,6 +458,26 @@ comments
   user_id         UUID FK → users
   body            TEXT
   created_at      TIMESTAMPTZ
+
+-- Monthly usage counters (plan quota enforcement — NFR-04.9)
+organization_usage
+  id                          UUID PK
+  organization_id             UUID FK → organizations
+  month                       DATE                       -- first day of the billing month, e.g. 2026-06-01
+  contracts_analyzed          INT DEFAULT 0
+  created_at                  TIMESTAMPTZ
+  UNIQUE (organization_id, month)
+
+-- Audit log (compliance events — NFR-04.11)
+audit_logs
+  id              UUID PK
+  organization_id UUID FK → organizations
+  user_id         UUID FK → users
+  event           TEXT        -- contract.viewed | contract.deleted | member.invited | member.removed
+  resource_id     UUID                               -- ID of the affected contract, user, etc.
+  resource_type   TEXT                               -- contract | user
+  metadata        JSONB                              -- additional context (e.g. IP address, user agent)
+  created_at      TIMESTAMPTZ
 ```
 
 ---
@@ -447,10 +485,14 @@ comments
 ## 8. API Contract
 
 ```yaml
+# System
+GET    /api/health                           # Liveness + Aurora connectivity check (HTTP 200 or 503)
+
 # Upload & Contracts
 POST   /api/contracts                        # Create contract record + return presigned S3 URL
-GET    /api/contracts                        # List organization's contracts
-GET    /api/contracts/:id                    # Get contract + latest analysis (polling endpoint)
+GET    /api/contracts                        # List organization's contracts (cursor-paginated)
+GET    /api/contracts/:id                    # Get contract + latest analysis (fallback polling endpoint)
+GET    /api/contracts/:id/status-stream      # SSE push stream; emits { status } when analysis completes
 DELETE /api/contracts/:id                    # Delete contract and all associated data
 
 # Analysis
@@ -523,6 +565,48 @@ These are out of scope for the MVP but represent the natural product roadmap pos
 
 ## 10. Changelog
 
+### v1.2.0 — June 2026 (Wave 0 + Wave 1 — Post-Hackathon Hardening)
+
+**Security**
+- NFR-04.8: Replaced long-lived `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` in Vercel with short-lived OIDC-federated credentials (GitHub Actions OIDC → IAM AssumeRole)
+- NFR-04.9: Added server-side plan quota enforcement on `POST /api/contracts` with HTTP 429 and Lambda-side idempotency guard
+- NFR-04.10: Added Content-Security-Policy headers covering pdfjs worker paths
+- NFR-04.11: Added append-only audit log for compliance-sensitive events
+
+**Observability**
+- NFR-05.5: `correlationId` (= `contractId`) threaded through Vercel, SQS message attributes, and Lambda logs
+- NFR-05.6: CloudWatch Alarm on SQS DLQ `NumberOfMessagesSent ≥ 1` with SNS notification
+- NFR-05.7: Sentry error tracking integrated in Vercel API layer and Lambda worker
+- NFR-05.8: SLOs defined: analysis success rate ≥ 99%, p95 latency ≤ 45s
+
+**Performance & Cost**
+- NFR-01.6: SSE push endpoint (`GET /api/contracts/:id/status-stream`) replaces polling as the primary analysis completion mechanism; polling retained as 30-second fallback
+- NFR-01.7: Cursor-based pagination on all list endpoints (`?limit=25&cursor=<token>`)
+- NFR-01.8: pdfjs-dist worker bundle lazy-loaded on contract detail route only
+- NFR-01.9: Extracted contract text stored in `analyses.extracted_text`; `/api/chat` reads column instead of re-fetching S3
+- NFR-01.10: CloudFront distribution added in front of S3 for global PDF delivery
+
+**Reliability**
+- NFR-03.5: SQS visibility timeout extended to 17 minutes; Lambda heartbeats via `ChangeMessageVisibility`
+- NFR-03.6: Lambda idempotency check prevents duplicate analyses from SQS re-deliveries
+- NFR-03.7: `GET /api/health` endpoint with Aurora connectivity check
+
+**Data Model**
+- `analyses`: added `extracted_text TEXT` and `raw_llm_output_s3_key TEXT` columns
+- Added `organization_usage` table for monthly quota tracking
+- Added `audit_logs` table for compliance event recording
+
+**API**
+- Added `GET /api/health`
+- Added `GET /api/contracts/:id/status-stream` (SSE)
+- `GET /api/contracts` now requires pagination parameters
+
+**Environment Variables**
+- Removed: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+- Added: `AWS_ROLE_ARN`, `CLOUDFRONT_DOMAIN`, `SENTRY_DSN`, `SENTRY_DSN_LAMBDA`
+
+---
+
 ### v1.1.0 — June 2026
 
 - Replaced OpenAI GPT-4o with Anthropic Claude 3.5 Sonnet via Amazon Bedrock
@@ -579,16 +663,21 @@ npm run dev
 |---|---|
 | `CLERK_SECRET_KEY` | Clerk backend secret key |
 | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Clerk frontend publishable key |
-| `DATABASE_URL` | Aurora PostgreSQL connection string |
+| `DATABASE_URL` | Aurora PostgreSQL connection string (writer endpoint) |
 | `AWS_REGION` | AWS region (e.g., `us-east-1`) |
-| `AWS_ACCESS_KEY_ID` | AWS access key (S3, SQS, SES, Bedrock — used by Vercel API Routes) |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key (used by Vercel API Routes) |
+| `AWS_ROLE_ARN` | IAM role ARN assumed by Vercel API Routes via OIDC federation (replaces static key pair — see NFR-04.8) |
 | `S3_BUCKET_NAME` | S3 bucket for PDF storage |
+| `CLOUDFRONT_DOMAIN` | CloudFront distribution domain for PDF delivery (see NFR-01.10) |
 | `SQS_QUEUE_URL` | SQS queue URL for analysis jobs |
 | `SES_FROM_EMAIL` | Verified SES sender address |
 | `BEDROCK_MODEL_ID` | Bedrock model ID (e.g., `anthropic.claude-3-5-sonnet-20241022-v2:0`) |
+| `SENTRY_DSN` | Sentry DSN for error tracking in Vercel API Routes |
+| `SENTRY_DSN_LAMBDA` | Sentry DSN for error tracking in the Lambda worker |
 
-> **Note:** Lambda→Bedrock calls use the Lambda IAM execution role (`bedrock:InvokeModel`). No `OPENAI_API_KEY` or separate Bedrock API key is required.
+> **Notes:**
+> - `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are **removed** in v1.2.0. Vercel API Routes assume `AWS_ROLE_ARN` via OIDC at request time — no long-lived key pair is stored.
+> - Lambda→Bedrock calls continue to use the Lambda IAM execution role (`bedrock:InvokeModel`). No API key is required.
+> - Lambda environment variables (`AWS_REGION`, `S3_BUCKET_NAME`, `SQS_QUEUE_URL`, `SES_FROM_EMAIL`, `BEDROCK_MODEL_ID`, `SENTRY_DSN_LAMBDA`) are set in the Lambda function configuration, not in Vercel.
 
 ### Branch Strategy
 
