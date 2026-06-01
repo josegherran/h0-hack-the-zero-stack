@@ -1,6 +1,6 @@
 # ContractLens — Product Specification
 
-> **Version:** 1.0.0
+> **Version:** 1.1.0
 > **Status:** Draft
 > **Hackathon:** H01 (h01.devpost.com) — June 2026
 > **Track:** Monetizable B2B App
@@ -523,14 +523,23 @@ These are out of scope for the MVP but represent the natural product roadmap pos
 
 ## 10. Changelog
 
+### v1.1.0 — June 2026
+
+- Replaced OpenAI GPT-4o with Anthropic Claude 3.5 Sonnet via Amazon Bedrock
+- Lambda analysis worker now authenticates to Bedrock via IAM role — no external API key
+- Chat streaming updated to use `@ai-sdk/amazon-bedrock` provider with Vercel AI SDK
+- Structured output migrated from OpenAI function calling to Claude tool use
+- Removed `OPENAI_API_KEY` from required environment variables
+- Added `bedrock:InvokeModel` to Lambda IAM execution role
+
 ### v1.0.0 — June 2026 (Hackathon MVP)
 
 - Initial release for H01 Hackathon
 - PDF upload via S3 presigned URLs
-- Async AI analysis pipeline: SQS → Lambda → GPT-4o → Aurora PostgreSQL
+- Async AI analysis pipeline: SQS → Lambda → Anthropic Claude 3.5 Sonnet (Amazon Bedrock) → Aurora PostgreSQL
 - Risk Score gauge (0–100) with animated display
 - Findings panel with PDF clause highlighting
-- Chat with the contract (Vercel AI SDK streaming)
+- Chat with the contract (Vercel AI SDK + `@ai-sdk/amazon-bedrock` streaming)
 - Key dates extraction and calendar view
 - Dashboard with stats and contract list
 - Multi-tenant workspaces with Clerk authentication
@@ -555,7 +564,7 @@ npm install
 
 # Copy environment variables
 cp .env.example .env.local
-# Fill in: CLERK_*, OPENAI_API_KEY, DATABASE_URL, AWS_*, S3_BUCKET
+# Fill in: CLERK_*, DATABASE_URL, AWS_*, S3_BUCKET
 
 # Run database migrations
 npm run db:migrate
@@ -570,14 +579,16 @@ npm run dev
 |---|---|
 | `CLERK_SECRET_KEY` | Clerk backend secret key |
 | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Clerk frontend publishable key |
-| `OPENAI_API_KEY` | OpenAI API key |
 | `DATABASE_URL` | Aurora PostgreSQL connection string |
 | `AWS_REGION` | AWS region (e.g., `us-east-1`) |
-| `AWS_ACCESS_KEY_ID` | AWS access key (for S3, SQS, SES) |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
+| `AWS_ACCESS_KEY_ID` | AWS access key (S3, SQS, SES, Bedrock — used by Vercel API Routes) |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key (used by Vercel API Routes) |
 | `S3_BUCKET_NAME` | S3 bucket for PDF storage |
 | `SQS_QUEUE_URL` | SQS queue URL for analysis jobs |
 | `SES_FROM_EMAIL` | Verified SES sender address |
+| `BEDROCK_MODEL_ID` | Bedrock model ID (e.g., `anthropic.claude-3-5-sonnet-20241022-v2:0`) |
+
+> **Note:** Lambda→Bedrock calls use the Lambda IAM execution role (`bedrock:InvokeModel`). No `OPENAI_API_KEY` or separate Bedrock API key is required.
 
 ### Branch Strategy
 
@@ -614,10 +625,10 @@ ContractLens addresses a real, measurable problem: the legal exposure gap that a
 
 The product is designed to be monetizable from day one, with a clear free-to-paid conversion path, a pricing model grounded in the value delivered (one avoided bad clause pays for years of subscription), and a roadmap that extends naturally into enterprise features, multi-language support, and legal marketplace integrations.
 
-The technical choices — presigned S3 uploads, async Lambda analysis, Vercel AI SDK streaming, and Aurora PostgreSQL's relational + JSONB hybrid model — are each justified by concrete constraints and tradeoffs, not convenience. The result is a system that can handle real contract volumes, real team collaboration, and real business decisions.
+The technical choices — presigned S3 uploads, async Lambda analysis, Vercel AI SDK streaming with Amazon Bedrock, and Aurora PostgreSQL's relational + JSONB hybrid model — are each justified by concrete constraints and tradeoffs, not convenience. Using Anthropic Claude 3.5 Sonnet via Amazon Bedrock keeps the entire AI pipeline within AWS: Lambda authenticates via IAM role, no external API key is needed, and all LLM traffic stays on AWS's private network. The result is a system that can handle real contract volumes, real team collaboration, and real business decisions.
 
 > **Legal Disclaimer:** ContractLens is an AI-powered assistance tool. It does not constitute legal advice and does not replace consultation with a qualified attorney. Always consult a legal professional before signing important documents.
 
 ---
 
-*ContractLens SPEC v1.0.0 — H01 Hackathon (h01.devpost.com) — June 2026*
+*ContractLens SPEC v1.1.0 — H01 Hackathon (h01.devpost.com) — June 2026*

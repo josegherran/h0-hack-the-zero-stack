@@ -1,0 +1,122 @@
+# ─── Dependencies ────────────────────────────────────────────────────────────
+node_modules/
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# ─── Environment Variables ───────────────────────────────────────────────────
+# Never commit secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+
+# ─── Build Output ────────────────────────────────────────────────────────────
+dist/
+dist-ssr/
+build/
+out/
+.output/
+
+# ─── Vite ────────────────────────────────────────────────────────────────────
+*.local
+
+# ─── Vercel ──────────────────────────────────────────────────────────────────
+.vercel/
+.vercel
+
+# ─── AWS Lambda ──────────────────────────────────────────────────────────────
+# Lambda build artifacts
+lambda/dist/
+lambda/node_modules/
+lambda/.build/
+cdk.out/
+*.zip
+
+# AWS CDK / SAM
+.aws-sam/
+samconfig.toml
+cdk.context.json
+
+# ─── Drizzle ORM ─────────────────────────────────────────────────────────────
+drizzle/meta/
+# Keep migration SQL files but ignore generated snapshots if preferred
+# drizzle/*.sql
+
+# ─── TypeScript ──────────────────────────────────────────────────────────────
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# ─── Testing ─────────────────────────────────────────────────────────────────
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+playwright/.cache/
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ─── Editor / IDE ────────────────────────────────────────────────────────────
+.vscode/settings.json
+.vscode/launch.json
+.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swp
+*.swo
+
+# ─── Package Manager Locks (keep one, ignore others) ─────────────────────────
+# Uncomment the lock file you are NOT using to avoid conflicts
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# ─── Temporary Files ─────────────────────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# ─── PDF Test Files ──────────────────────────────────────────────────────────
+# Avoid committing real contract PDFs used during local testing
+*.pdf
+!public/**/*.pdf
+
+# ─── Clerk ───────────────────────────────────────────────────────────────────
+# Clerk keys are in .env — nothing extra to ignore
+
+# ─── Orval (API Codegen) ─────────────────────────────────────────────────────
+# Generated hooks — can be regenerated from OpenAPI spec
+src/api/generated/
+
+# ─── Misc ────────────────────────────────────────────────────────────────────
+.cache/
+.parcel-cache/
+.eslintcache
+.stylelintcache
+storybook-static/

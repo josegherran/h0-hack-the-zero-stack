@@ -519,7 +519,7 @@ Be conservative: when in doubt, flag as medium or high risk.
 
 ## 14. License
 
-MIT License
+This project is licensed under the [MIT License](./LICENSE). 
 
 ---
 
